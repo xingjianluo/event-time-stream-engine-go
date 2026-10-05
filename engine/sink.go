@@ -1,11 +1,22 @@
 package engine
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // Sink 接收窗口结果，写入必须幂等：
 // 同一 (Key, Window) 的结果无论写多少次，对外可见效果等同于写一次。
 type Sink interface {
 	Write(result WindowResult) error
+}
+
+// ExpirableSink 是可选接口：支持按窗口结束时间回收旧结果的汇。
+// 引擎在配置了结果保留策略（Config.ResultRetention > 0）且汇实现该接口时，
+// 会在水位线前进后回收保留期之外的结果，防止历史输出无限堆积。
+type ExpirableSink interface {
+	// ExpireBefore 回收 Window.End <= windowEnd 的结果，返回被回收的结果列表。
+	ExpireBefore(windowEnd int64) []WindowResult
 }
 
 // MemSink 是内存幂等汇：以 (Key, Window) 为幂等键覆盖保存最新结果，
@@ -58,4 +69,24 @@ func (m *MemSink) Results() map[string]WindowResult {
 		out[k] = v
 	}
 	return out
+}
+
+// ExpireBefore 实现 ExpirableSink：回收 Window.End <= windowEnd 的结果，
+// 返回被回收的结果列表（按幂等键排序，顺序确定，便于解释回收了什么）。
+func (m *MemSink) ExpireBefore(windowEnd int64) []WindowResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var keys []string
+	for k, r := range m.results {
+		if r.Window.End <= windowEnd {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	expired := make([]WindowResult, 0, len(keys))
+	for _, k := range keys {
+		expired = append(expired, m.results[k])
+		delete(m.results, k)
+	}
+	return expired
 }

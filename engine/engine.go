@@ -23,14 +23,20 @@ type Config struct {
 	WindowSize      int64 // 滚动窗口大小（毫秒）
 	AllowedLateness int64 // 允许迟到时间（毫秒）
 	MaxSeenIDs      int   // 去重表容量上限，<=0 表示不限制（有界内存约束下应设正数）
+	// ResultRetention 是窗口结果在“不可再被修正”之后的额外保留时长（毫秒）。
+	// 结果在 全局水位线 >= Window.End + AllowedLateness + ResultRetention 时被回收；
+	// <=0 表示永久保留（历史结果会持续堆积）。
+	// 保留期内的结果绝不被回收，因此仍可被迟到事件的修正性重触发覆盖。
+	ResultRetention int64
 }
 
 // Hooks 是可选的观测钩子，用于测试日志打印事件、窗口与水位线变化。
 type Hooks struct {
-	OnEvent     func(ev Event, accepted bool, reason string)
-	OnEmit      func(r WindowResult)
-	OnWatermark func(partition int, wm int64, global int64)
-	OnPurge     func(key string, w Window)
+	OnEvent        func(ev Event, accepted bool, reason string)
+	OnEmit         func(r WindowResult)
+	OnWatermark    func(partition int, wm int64, global int64)
+	OnPurge        func(key string, w Window)
+	OnResultExpire func(r WindowResult) // 结果因保留策略被回收
 }
 
 // Engine 是事件时间流处理引擎。
@@ -43,6 +49,7 @@ type Engine struct {
 	windows map[string]map[int64]*windowState // key -> windowStart -> 状态
 	seen    map[string]struct{}               // 幂等去重表
 	seenOrd []string                          // FIFO 驱逐顺序，保证有界内存
+	offsets map[int]Position                  // 各分区已提交消费位置
 	sink    Sink
 	hooks   Hooks
 }
@@ -54,6 +61,7 @@ func NewEngine(cfg Config, sink Sink, hooks Hooks) *Engine {
 		tracker: NewWatermarkTracker(),
 		windows: make(map[string]map[int64]*windowState),
 		seen:    make(map[string]struct{}),
+		offsets: make(map[int]Position),
 		sink:    sink,
 		hooks:   hooks,
 	}
@@ -66,6 +74,7 @@ func (e *Engine) Ingest(ev Event) error {
 	defer e.mu.Unlock()
 
 	if _, dup := e.seen[ev.ID]; dup {
+		e.trackOffset(ev) // 重投递也被消费过，位置随之前进
 		if e.hooks.OnEvent != nil {
 			e.hooks.OnEvent(ev, false, "duplicate")
 		}
@@ -83,6 +92,7 @@ func (e *Engine) Ingest(ev Event) error {
 	}
 
 	e.markSeen(ev.ID)
+	e.trackOffset(ev)
 	ws := e.windowState(ev.Key, w.Start)
 	ws.Sum += ev.Value
 	ws.Count++
@@ -142,6 +152,22 @@ func (e *Engine) AdvanceWatermark(partition int, wm int64) {
 			delete(e.windows, k)
 		}
 	}
+
+	// 结果保留：回收“不可再被修正”且超出额外保留时长的历史结果，
+	// 防止长时间运行下输出无限堆积。保留期内的结果不受影响。
+	if e.cfg.ResultRetention > 0 {
+		if es, ok := e.sink.(ExpirableSink); ok {
+			// 截止线包含允许迟到期：Window.End <= cutoff 的结果
+			// 满足 全局水位线 >= Window.End + AllowedLateness + ResultRetention，
+			// 即修正窗口与额外保留期都已过，回收是安全的。
+			cutoff := global - e.cfg.AllowedLateness - e.cfg.ResultRetention
+			for _, r := range es.ExpireBefore(cutoff) {
+				if e.hooks.OnResultExpire != nil {
+					e.hooks.OnResultExpire(r)
+				}
+			}
+		}
+	}
 }
 
 // Watermark 返回当前全局水位线。
@@ -149,6 +175,17 @@ func (e *Engine) Watermark() int64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.tracker.Global()
+}
+
+// Offsets 返回各分区已提交消费位置的副本，用于驱动数据源续传。
+func (e *Engine) Offsets() map[int]Position {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[int]Position, len(e.offsets))
+	for p, pos := range e.offsets {
+		out[p] = pos
+	}
+	return out
 }
 
 // Snapshot 在当前已提交水位线处生成一致快照。
@@ -161,6 +198,10 @@ func (e *Engine) Snapshot() Snapshot {
 		Committed:  e.tracker.Global(),
 		Windows:    make(map[string]map[int64]windowState, len(e.windows)),
 		Seen:       make([]string, len(e.seenOrd)),
+		Offsets:    make(map[int]Position, len(e.offsets)),
+	}
+	for p, pos := range e.offsets {
+		snap.Offsets[p] = pos
 	}
 	for k, m := range e.windows {
 		snap.Windows[k] = make(map[int64]windowState, len(m))
@@ -209,6 +250,10 @@ func (e *Engine) Restore(snap Snapshot) error {
 	for _, id := range e.seenOrd {
 		e.seen[id] = struct{}{}
 	}
+	e.offsets = make(map[int]Position, len(snap.Offsets))
+	for p, pos := range snap.Offsets {
+		e.offsets[p] = pos
+	}
 	return nil
 }
 
@@ -234,6 +279,16 @@ func (e *Engine) windowState(key string, start int64) *windowState {
 		m[start] = ws
 	}
 	return ws
+}
+
+// trackOffset 记录分区的消费位置：取已见最大 Seq 及其事件 ID。
+// 被拒绝（迟到）的事件不进入位置，重启后源会重新投递它们并被再次拒绝。
+// 调用方须持有锁。
+func (e *Engine) trackOffset(ev Event) {
+	cur, ok := e.offsets[ev.Partition]
+	if !ok || ev.Seq >= cur.Seq {
+		e.offsets[ev.Partition] = Position{Seq: ev.Seq, LastID: ev.ID}
+	}
 }
 
 // markSeen 记录事件 ID；超出容量时按 FIFO 驱逐最旧条目，保证有界内存。
