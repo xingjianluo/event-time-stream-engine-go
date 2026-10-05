@@ -31,6 +31,7 @@ type Hooks struct {
 	OnEmit      func(r WindowResult)
 	OnWatermark func(partition int, wm int64, global int64)
 	OnPurge     func(key string, w Window)
+	OnReclaim   func(report ReclaimReport)
 }
 
 // Engine 是事件时间流处理引擎。
@@ -111,6 +112,7 @@ func (e *Engine) AdvanceWatermark(partition int, wm int64) {
 	if e.hooks.OnWatermark != nil {
 		e.hooks.OnWatermark(partition, wm, global)
 	}
+	e.expireResults(global)
 
 	// 按键与窗口起始排序，保证触发顺序确定。
 	keys := make([]string, 0, len(e.windows))
@@ -209,7 +211,23 @@ func (e *Engine) Restore(snap Snapshot) error {
 	for _, id := range e.seenOrd {
 		e.seen[id] = struct{}{}
 	}
+	// 恢复后按恢复出的水位线回收历史结果（若汇支持），
+	// 使新进程的输出容量与状态保持一致；钩子报告回收内容与原因。
+	e.expireResults(e.tracker.Global())
 	return nil
+}
+
+// expireResults 在全局水位线前进/恢复后通知汇回收过期历史结果。
+// 保护下限传 AllowedLateness：仍可能被迟到事件修正的结果不会被回收。
+func (e *Engine) expireResults(global int64) {
+	rc, ok := e.sink.(Reclaimer)
+	if !ok {
+		return
+	}
+	report := rc.Expire(global, e.cfg.AllowedLateness)
+	if e.hooks.OnReclaim != nil && (len(report.Evicted) > 0 || report.Before != report.After) {
+		e.hooks.OnReclaim(report)
+	}
 }
 
 // emit 向汇写入窗口结果（幂等），并触发观测钩子。调用方须持有锁。

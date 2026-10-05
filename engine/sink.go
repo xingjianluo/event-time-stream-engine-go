@@ -59,3 +59,10 @@ func (m *MemSink) Results() map[string]WindowResult {
 	}
 	return out
 }
+
+// Len 返回当前保留的结果数量。
+func (m *MemSink) Len() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.results)
+}
